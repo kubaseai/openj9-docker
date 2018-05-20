@@ -1,0 +1,166 @@
+diff --git a/configure b/configure
+old mode 100644
+new mode 100755
+diff --git a/get_source.sh b/get_source.sh
+old mode 100644
+new mode 100755
+diff --git a/jdk/src/java.management.rmi/share/classes/javax/management/remote/rmi/RMIConnector.java b/jdk/src/java.management.rmi/share/classes/javax/management/remote/rmi/RMIConnector.java
+index 16eeff47d4..f4151374f4 100644
+--- a/jdk/src/java.management.rmi/share/classes/javax/management/remote/rmi/RMIConnector.java
++++ b/jdk/src/java.management.rmi/share/classes/javax/management/remote/rmi/RMIConnector.java
+@@ -1756,6 +1756,15 @@ public class RMIConnector implements JMXConnector, Serializable, JMXAddressable
+     // Private stuff - Check if stub can be trusted.
+     //--------------------------------------------------------------------
+ 
++    private static RMIClientSocketFactory getClientSocketFactory(Remote stub) {
++        RemoteRef ref = ((RemoteObject)stub).getRef();
++        if (ref.getClass() == UnicastRef2.class) {
++            LiveRef liveRef = ((UnicastRef2)ref).getLiveRef();
++            return liveRef.getClientSocketFactory();
++        }
++        return null;
++    }
++
+     private static void checkStub(Remote stub,
+             Class<?> stubClass) {
+ 
+@@ -1791,6 +1800,8 @@ public class RMIConnector implements JMXConnector, Serializable, JMXAddressable
+         //
+         LiveRef liveRef = ((UnicastRef2)ref).getLiveRef();
+         RMIClientSocketFactory csf = liveRef.getClientSocketFactory();
++        if (csf.getClass().getName().contains("FileRMISocketFactory"))
++	    return;
+         if (csf == null || csf.getClass() != SslRMIClientSocketFactory.class)
+             throw new SecurityException(
+                     "Expecting a " + SslRMIClientSocketFactory.class.getName() +
+@@ -2101,6 +2112,9 @@ public class RMIConnector implements JMXConnector, Serializable, JMXAddressable
+             Object credentials,
+             boolean checkStub)
+             throws IOException {
++
++        RMIClientSocketFactory csf = getClientSocketFactory(server);
++        boolean isFileRMI = csf!=null && csf.getClass().getName().contains("FileRMISocketFactory");
+         RMIConnection c = server.newClient(credentials);
+         if (checkStub) checkStub(c, rmiConnectionImplStubClass);
+         try {
+diff --git a/jdk/src/jdk.jconsole/share/classes/sun/tools/jconsole/LocalVirtualMachine.java b/jdk/src/jdk.jconsole/share/classes/sun/tools/jconsole/LocalVirtualMachine.java
+index ff5c63813e..f347168538 100644
+--- a/jdk/src/jdk.jconsole/share/classes/sun/tools/jconsole/LocalVirtualMachine.java
++++ b/jdk/src/jdk.jconsole/share/classes/sun/tools/jconsole/LocalVirtualMachine.java
+@@ -160,30 +160,39 @@ public class LocalVirtualMachine {
+ 
+     private static void getAttachableVMs(Map<Integer, LocalVirtualMachine> map) {
+         List<VirtualMachineDescriptor> vms = VirtualMachine.list();
++	int counter = 0;
+         for (VirtualMachineDescriptor vmd : vms) {
++	    Integer vmid = null;
+             try {
+-                Integer vmid = Integer.valueOf(vmd.id());
+-                if (!map.containsKey(vmid)) {
+-                    boolean attachable = false;
+-                    String address = null;
+-                    try {
+-                        VirtualMachine vm = VirtualMachine.attach(vmd);
+-                        attachable = true;
+-                        Properties agentProps = vm.getAgentProperties();
+-                        address = (String) agentProps.get(LOCAL_CONNECTOR_ADDRESS_PROP);
+-                        vm.detach();
+-                    } catch (AttachNotSupportedException x) {
+-                        // not attachable
+-                    } catch (IOException x) {
+-                        // ignore
+-                    }
+-                    map.put(vmid, new LocalVirtualMachine(vmid.intValue(),
++                vmid = Integer.valueOf(vmd.id());
++	    }
++	    catch (NumberFormatException nfe) {
++		/**
++		 * IBM's JVM allows for overriding vm id with com.ibm.tools.attach.id (string).
++		 * Let's try to fit into Sun assumption that id is pid. F
++		 * We can find some base above PID_MAX (on 64-bits 1 << 22):
++		 * 5000000 should have good look with counted JVMs.
++		 */
++		vmid = 5000000 + ++counter;
++	    }
++            if (!map.containsKey(vmid)) {
++                boolean attachable = false;
++                String address = null;
++                try {
++                    VirtualMachine vm = VirtualMachine.attach(vmd);
++                    attachable = true;
++                    Properties agentProps = vm.getAgentProperties();
++                    address = (String) agentProps.get(LOCAL_CONNECTOR_ADDRESS_PROP);
++                    vm.detach();
++                } catch (AttachNotSupportedException x) {
++                    // not attachable
++                } catch (IOException x) {
++                    // ignore
++                }
++                map.put(vmid, new LocalVirtualMachine(vmid.intValue(),
+                                                           vmd.displayName(),
+                                                           attachable,
+                                                           address));
+-                }
+-            } catch (NumberFormatException e) {
+-                // do not support vmid different than pid
+             }
+         }
+     }
+@@ -226,14 +235,23 @@ public class LocalVirtualMachine {
+     private void loadManagementAgent() throws IOException {
+         VirtualMachine vm = null;
+         String name = String.valueOf(vmid);
+-        try {
+-            vm = VirtualMachine.attach(name);
+-        } catch (AttachNotSupportedException x) {
+-            IOException ioe = new IOException(x.getMessage());
+-            ioe.initCause(x);
+-            throw ioe;
++	IOException ioe = null;
++	String[] ids = new String[] { name, displayName };
++	for (String id : ids) {
++        	try {
++            		vm = VirtualMachine.attach(id);
++			ioe = null;
++			break;
++        	} catch (AttachNotSupportedException x) {
++            		if (ioe==null) {
++				ioe = new IOException(id+": "+x.getMessage());
++            			ioe.initCause(x);
++			}
++            	}
+         }
+-
++	
++	if (ioe!=null)
++		throw ioe;
+         vm.startLocalManagementAgent();
+ 
+         // get the connector address
+diff --git a/jdk/src/jdk.management.agent/share/classes/sun/management/jmxremote/ConnectorBootstrap.java b/jdk/src/jdk.management.agent/share/classes/sun/management/jmxremote/ConnectorBootstrap.java
+index d161593401..362c449dd7 100644
+--- a/jdk/src/jdk.management.agent/share/classes/sun/management/jmxremote/ConnectorBootstrap.java
++++ b/jdk/src/jdk.management.agent/share/classes/sun/management/jmxremote/ConnectorBootstrap.java
+@@ -547,11 +547,21 @@ public final class ConnectorBootstrap {
+             }
+             String useLocalOnlyStr = props.getProperty(
+                     PropertyNames.USE_LOCAL_ONLY, DefaultValues.USE_LOCAL_ONLY);
+-            boolean useLocalOnly = Boolean.valueOf(useLocalOnlyStr).booleanValue();
++            boolean useLocalOnly = false;
++            try {
++                useLocalOnly = Boolean.valueOf(useLocalOnlyStr).booleanValue();
++            }
++            catch (Exception e) {}
+             if (useLocalOnly) {
+                 env.put(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE,
+                         new LocalRMIServerSocketFactory());
+             }
++            else if ("files".equalsIgnoreCase(useLocalOnlyStr)) {
++                FileRMISocketFactory ssf = new FileRMISocketFactory();
++                FileRMISocketFactory csf = ssf.getClientSocketFactory();
++                env.put(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE,ssf);
++                env.put(RMIConnectorServer.RMI_CLIENT_SOCKET_FACTORY_ATTRIBUTE,csf);
++            }
+             JMXConnectorServer server =
+                     JMXConnectorServerFactory.newJMXConnectorServer(url, env, mbs);
+             server.start();

@@ -1,0 +1,192 @@
+diff --git a/jcl/src/java.base/share/classes/com/ibm/tools/attach/target/Attachment.java b/jcl/src/java.base/share/classes/com/ibm/tools/attach/target/Attachment.java
+index 82325437..1c494176 100644
+--- a/jcl/src/java.base/share/classes/com/ibm/tools/attach/target/Attachment.java
++++ b/jcl/src/java.base/share/classes/com/ibm/tools/attach/target/Attachment.java
+@@ -61,6 +61,7 @@ final class Attachment extends Thread implements Response {
+ 	private final String key;
+ 	private static final String START_REMOTE_MANAGEMENT_AGENT = "startRemoteManagementAgent"; //$NON-NLS-1$
+ 	private static final String START_LOCAL_MANAGEMENT_AGENT = "startLocalManagementAgent"; //$NON-NLS-1$
++	private static final String HOSTNAME_OVERRIDE_PROPERTY = "com.ibm.tools.attach.target.hostname"; //$NON-NLS-1$
+ 
+ 	private static final class MethodRefsHolder {
+ 		static Method startLocalManagementAgentMethod = null;
+@@ -109,6 +110,19 @@ final class Attachment extends Thread implements Response {
+ 		setDaemon(true);
+ 	}
+ 
++	static String getOverridenLocalHostName() {
++		/** In case we are crossing (Docker) container boundaries
++		  * we have two different localhosts - the one we
++		  * are attaching from into container is 'external' localhost.
++		  * Let's allow for accessing it with overriden hostname */
++
++		/** from JavaDoc InetAddress.getByName: If the host is null then an InetAddress
++		  * representing an address of the loopback interface is returned */
++
++		return System.getProperty(HOSTNAME_OVERRIDE_PROPERTY);
++	}
++	
++	    
+ 	/**
+ 	 * Create an attachment with a socket connection to the attacher
+ 	 * 
+@@ -118,7 +132,7 @@ final class Attachment extends Thread implements Response {
+ 	 */
+ 	boolean connectToAttacher(int portNum) {
+ 		try {
+-			InetAddress localHost = InetAddress.getLoopbackAddress();
++			InetAddress localHost = InetAddress.getByName(getOverridenLocalHostName());
+ 			attacherSocket = new Socket(localHost, portNum);
+ 			IPC.logMessage("connectToAttacher localPort=",  attacherSocket.getLocalPort(), " remotePort=", Integer.toString(attacherSocket.getPort())); //$NON-NLS-1$//$NON-NLS-2$
+ 			responseStream = attacherSocket.getOutputStream();
+diff --git a/jcl/src/java.base/share/classes/com/ibm/tools/attach/target/IPC.java b/jcl/src/java.base/share/classes/com/ibm/tools/attach/target/IPC.java
+index a522582f..cde5079d 100644
+--- a/jcl/src/java.base/share/classes/com/ibm/tools/attach/target/IPC.java
++++ b/jcl/src/java.base/share/classes/com/ibm/tools/attach/target/IPC.java
+@@ -32,6 +32,7 @@ import java.io.PrintStream;
+ import java.util.Objects;
+ import java.util.Properties;
+ import java.util.Random;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ /**
+  * Utility class for operating system calls
+@@ -49,7 +50,6 @@ public class IPC {
+ 	static final int TRACEPOINT_STATUS_OOM_DURING_TERMINATE = -3;
+ 	static final String LOCAL_CONNECTOR_ADDRESS = "com.sun.management.jmxremote.localConnectorAddress"; //$NON-NLS-1$
+ 
+-
+ 	private static Random randomGen; /* Cleanup. this is used by multiple threads */
+ 	static  PrintStream logStream; /* cleanup.  Used by multiple threads */
+ 	static volatile boolean loggingEnabled; /* set at initialization time and not changed */
+@@ -89,8 +89,6 @@ public class IPC {
+ 
+ 	static native int mkdirWithPermissionsImpl(String absolutePath, int perms);
+ 
+-	/*[PR Jazz 30075] setupSemaphore was re-doing what createDirectoryAndSemaphore (now called prepareCommonDirectory) did already */
+-
+ 	/**
+ 	 * 
+ 	 * @param ctrlDir Location of the control file
+@@ -154,6 +152,108 @@ public class IPC {
+ 	 /* CMVC 161414 - PIDs and UIDs are long */
+ 	static native long getProcessId();
+ 
++	/**
++	 * Build OS command to check if CONTAINER is known (marked with 1 on stdout).
++	 * If can be supplied via CONTAINER_EXISTS_CMD environment variable or via
++	 * -Dcom.ibm.tools.attach.containerExistsCmd. If we get nothing we assume docker */
++	public static String[] buildContainerExistsCmd() {
++		boolean isWindows = System.getProperty("os.name").toLowerCase().contains("windows");
++		String envCmd = System.getenv("CONTAINER_EXISTS_CMD");
++		if (envCmd!=null && envCmd.length()==0)
++			envCmd = null;
++		
++		String containerExistsCmd = envCmd!=null ? envCmd /* container engine is nice to set this */
++			: /* or not, and image creator must take care of this */
++
++		System.getProperty("com.ibm.tools.attach.containerExistsCmd",
++			"docker container inspect --format={{1}} \""+
++			(isWindows ? "%%CONTAINER%%" : "$CONTAINER")+"\"");
++
++		/** we cannot use 'docker ps | grep -c' because grep is not on Windows 10 or 2019 */
++		/** current user must have rights to call docker command (be in docker group) */
++
++		String[] args = isWindows ?
++			new String[] { "cmd.exe", "/c", containerExistsCmd } :
++			new String[] { "/bin/sh", "-c", containerExistsCmd }; /* Linux, FreeBSD, Solaris, OS X */
++		return args;
++	}
++		
++	/**
++	 * Check if standard process or container exists. Container usually wraps only 1 Java process,
++	 * so when container can be inspected assume that its JVM process exists.
++	 */
++	public static boolean processExists(long pid, String possibleContainerId) {
++		long pidFromId = 0;
++		try {
++			pidFromId = Long.parseLong(possibleContainerId);
++		}
++		catch (NumberFormatException notNumber) {}
++		if (pidFromId==pid)
++			return processExists(pid);
++
++		/* if we are here then property com.ibm.tools.attach.id may contain
++		 * container identifier: container_6b54b6fa18e7_image_name_version */
++
++		long cmdTimeoutMillis = 5000;
++		String timeoutStr = System.getProperty("com.ibm.tools.attach.containerExistsCmd.timeout", cmdTimeoutMillis+"");
++		try {
++			cmdTimeoutMillis = Long.parseLong(timeoutStr);
++		}
++		catch (NumberFormatException parseExc) {}
++
++		/* strip down attach.id string */
++		String container = possibleContainerId.replace("container_", "");
++		int sepPos = container.indexOf('_');
++		if (sepPos!=-1)
++			container = container.substring(0, sepPos);
++		
++		return runContainerExistsCmd(container, buildContainerExistsCmd(), cmdTimeoutMillis);
++	}
++
++	public static boolean runContainerExistsCmd(final String container, final String[] args, final long cmdTimeoutMillis) {
++		Process p = null;
++		InputStream is = null;
++		boolean result = false;
++
++		try {
++			ProcessBuilder pb = new ProcessBuilder(args);
++			pb.environment().put("CONTAINER", container);
++			p = pb.start();
++			is = p.getInputStream();
++			if (is.available()>0)
++				result = is.read() == '1';
++			else {
++				final Process proc = p;
++				new Thread() {
++					public void run() {
++						try {
++							Thread.sleep(cmdTimeoutMillis);
++						}
++						catch (Exception ignore) {};
++						proc.destroy();
++					}
++				}.start();
++				result = is.read() == '1';
++			}
++		}
++		catch (Exception e) {
++			logMessage("exception on running container check cmd ",e);
++		}
++		finally {
++			if (p!=null) {
++				p.destroy();
++			}
++			if (is!=null) {
++				try {
++					is.close();
++				}
++				catch (Exception exc) {}
++			}
++		}
++		logMessage("containerExists "+container+"="+result);
++		return result; 
++	}
++
+ 	/**
+ 	 * @param pid process ID
+ 	 * @return true if process exists 
+diff --git a/jcl/src/jdk.attach/share/classes/com/ibm/tools/attach/attacher/OpenJ9AttachProvider.java b/jcl/src/jdk.attach/share/classes/com/ibm/tools/attach/attacher/OpenJ9AttachProvider.java
+index 71efee00..a048240d 100644
+--- a/jcl/src/jdk.attach/share/classes/com/ibm/tools/attach/attacher/OpenJ9AttachProvider.java
++++ b/jcl/src/jdk.attach/share/classes/com/ibm/tools/attach/attacher/OpenJ9AttachProvider.java
+@@ -138,7 +138,7 @@ public class OpenJ9AttachProvider extends AttachProvider {
+ 					if (null != descriptor) {
+ 						long pid = descriptor.getProcessId();
+ 						uid = descriptor.getUid();
+-						if ((0 == pid) || IPC.processExists(pid)) {
++						if ((0 == pid) || IPC.processExists(pid, f.getName())) {
+ 							descriptors.add(descriptor);
+ 							staleDirectory = false;
+ 						}
