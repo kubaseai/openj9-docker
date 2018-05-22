@@ -1,45 +1,21 @@
-diff --git a/configure b/configure
-old mode 100644
-new mode 100755
-diff --git a/get_source.sh b/get_source.sh
-old mode 100644
-new mode 100755
 diff --git a/jdk/src/java.management.rmi/share/classes/javax/management/remote/rmi/RMIConnector.java b/jdk/src/java.management.rmi/share/classes/javax/management/remote/rmi/RMIConnector.java
-index 16eeff47d4..f4151374f4 100644
+index 16eeff47d4..db21820c75 100644
 --- a/jdk/src/java.management.rmi/share/classes/javax/management/remote/rmi/RMIConnector.java
 +++ b/jdk/src/java.management.rmi/share/classes/javax/management/remote/rmi/RMIConnector.java
-@@ -1756,6 +1756,15 @@ public class RMIConnector implements JMXConnector, Serializable, JMXAddressable
-     // Private stuff - Check if stub can be trusted.
-     //--------------------------------------------------------------------
- 
-+    private static RMIClientSocketFactory getClientSocketFactory(Remote stub) {
-+        RemoteRef ref = ((RemoteObject)stub).getRef();
-+        if (ref.getClass() == UnicastRef2.class) {
-+            LiveRef liveRef = ((UnicastRef2)ref).getLiveRef();
-+            return liveRef.getClientSocketFactory();
-+        }
-+        return null;
-+    }
-+
-     private static void checkStub(Remote stub,
-             Class<?> stubClass) {
- 
-@@ -1791,6 +1800,8 @@ public class RMIConnector implements JMXConnector, Serializable, JMXAddressable
+@@ -1791,6 +1791,8 @@ public class RMIConnector implements JMXConnector, Serializable, JMXAddressable
          //
          LiveRef liveRef = ((UnicastRef2)ref).getLiveRef();
          RMIClientSocketFactory csf = liveRef.getClientSocketFactory();
-+        if (csf.getClass().getName().contains("FileRMISocketFactory"))
-+	    return;
++        if (csf!=null && csf.getClass().getName().equals("sun.management.jmxremote.FileRMISocketFactory"))
++	    return; /* no class comparison due to different modules */
          if (csf == null || csf.getClass() != SslRMIClientSocketFactory.class)
              throw new SecurityException(
                      "Expecting a " + SslRMIClientSocketFactory.class.getName() +
-@@ -2101,6 +2112,9 @@ public class RMIConnector implements JMXConnector, Serializable, JMXAddressable
+@@ -2101,6 +2103,7 @@ public class RMIConnector implements JMXConnector, Serializable, JMXAddressable
              Object credentials,
              boolean checkStub)
              throws IOException {
 +
-+        RMIClientSocketFactory csf = getClientSocketFactory(server);
-+        boolean isFileRMI = csf!=null && csf.getClass().getName().contains("FileRMISocketFactory");
          RMIConnection c = server.newClient(credentials);
          if (checkStub) checkStub(c, rmiConnectionImplStubClass);
          try {
@@ -137,6 +113,18 @@ index ff5c63813e..f347168538 100644
          vm.startLocalManagementAgent();
  
          // get the connector address
+diff --git a/jdk/src/jdk.management.agent/share/classes/module-info.java b/jdk/src/jdk.management.agent/share/classes/module-info.java
+index 921744822b..df4ffa4441 100644
+--- a/jdk/src/jdk.management.agent/share/classes/module-info.java
++++ b/jdk/src/jdk.management.agent/share/classes/module-info.java
+@@ -39,6 +39,7 @@ module jdk.management.agent {
+     requires java.management.rmi;
+ 
+     exports jdk.internal.agent to jdk.jconsole;
++    exports sun.management.jmxremote to java.management.rmi;
+ 
+     uses jdk.internal.agent.spi.AgentProvider;
+ }
 diff --git a/jdk/src/jdk.management.agent/share/classes/sun/management/jmxremote/ConnectorBootstrap.java b/jdk/src/jdk.management.agent/share/classes/sun/management/jmxremote/ConnectorBootstrap.java
 index d161593401..362c449dd7 100644
 --- a/jdk/src/jdk.management.agent/share/classes/sun/management/jmxremote/ConnectorBootstrap.java
